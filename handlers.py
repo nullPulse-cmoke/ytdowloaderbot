@@ -1,100 +1,47 @@
+import asyncio
 import os
+import uuid
 import yt_dlp
 from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 router = Router()
-user_urls = {}  
+
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB (Лимит стандартного Bot API)
 
 
-
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    await message.answer(
-        "👋 Привет! Я скачиваю видео и музыку с YouTube.\n\n"
-        "Просто отправь мне ссылку на видео 🎬"
-    )
+class DownloadState(StatesGroup):
+    url = State()
 
 
-
-@router.message(F.text.startswith("http"))
-async def handle_url(message: Message):
-    url = message.text.strip()
-    user_urls[message.from_user.id] = url
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🎵 MP3 (аудио)", callback_data="audio"),
-        ],
-        [
-            InlineKeyboardButton(text="📱 360p", callback_data="360"),
-            InlineKeyboardButton(text="💻 720p", callback_data="720"),
-            InlineKeyboardButton(text="🖥 1080p", callback_data="1080"),
-        ]
-    ])
-
-    await message.answer("Что скачать?", reply_markup=keyboard)
-
-
-
-@router.callback_query(F.data.in_({"audio", "360", "720", "1080"}))
-async def handle_choice(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    url = user_urls.get(user_id)
-
-    if not url:
-        await callback.message.answer("❌ Сначала отправь ссылку на видео!")
-        await callback.answer()
-        return
-
-    choice = callback.data
-    await callback.message.edit_text("⏳ Скачиваю, подожди...")
-
-    try:
-        if choice == "audio":
-            file_path = await download(url, mode="audio")
-            await callback.message.answer_audio(
-                audio=open(file_path, "rb"),
-                caption="🎵 Готово!"
-            )
-        else:
-            file_path = await download(url, mode="video", quality=choice)
-            await callback.message.answer_video(
-                video=open(file_path, "rb"),
-                caption=f"🎬 Готово! ({choice}p)"
-            )
-
-        os.remove(file_path)
-
-    except Exception as e:
-        await callback.message.answer(f"❌ Ошибка: {e}")
-
-    await callback.answer()
-
-
-async def download(url: str, mode: str, quality: str = "720") -> str:
-    output_dir = "downloads"
-    os.makedirs(output_dir, exist_ok=True)
+def _sync_download(url: str, mode: str, quality: str, out_prefix: str) -> str:
+    """Синхронная функция скачивания для запуска в отдельном потоке."""
+    output_template = f"downloads/{out_prefix}_%(title).100s.%(ext)s"
 
     if mode == "audio":
         ydl_opts = {
             "format": "bestaudio/best",
-            "outtmpl": f"{output_dir}/%(title)s.%(ext)s",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
+            "outtmpl": output_template,
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
             "quiet": True,
+            "no_warnings": True,
         }
     else:
-        height = quality
         ydl_opts = {
-            "format": f"bestvideo[height<={height}]+bestaudio/best[height<={height}]",
-            "outtmpl": f"{output_dir}/%(title)s.%(ext)s",
+            "format": f"bestvideo[height<={quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality}][ext=mp4]/best",
+            "outtmpl": output_template,
             "merge_output_format": "mp4",
             "quiet": True,
+            "no_warnings": True,
         }
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -105,3 +52,79 @@ async def download(url: str, mode: str, quality: str = "720") -> str:
             filename = os.path.splitext(filename)[0] + ".mp3"
 
     return filename
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "👋 Отправь ссылку на YouTube видео, чтобы скачать его в MP3 или MP4."
+    )
+
+
+@router.message(F.text.regexp(r"^(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+"))
+async def handle_url(message: Message, state: FSMContext):
+    url = message.text.strip()
+    await state.update_data(url=url)
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🎵 MP3 (Аудио)", callback_data="dl:audio:0")],
+            [
+                InlineKeyboardButton(text="📱 360p", callback_data="dl:video:360"),
+                InlineKeyboardButton(text="💻 720p", callback_data="dl:video:720"),
+                InlineKeyboardButton(text="🖥 1080p", callback_data="dl:video:1080"),
+            ],
+        ]
+    )
+
+    await message.answer("Выберите формат:", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("dl:"))
+async def handle_download(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    url = data.get("url")
+
+    if not url:
+        await callback.answer("❌ Ссылка устарела. Отправьте ее заново.", show_alert=True)
+        return
+
+    _, mode, quality = callback.data.split(":")
+    await callback.message.edit_text("⏳ Скачиваю и обрабатываю файл...")
+
+    os.makedirs("downloads", exist_ok=True)
+    task_id = uuid.uuid4().hex[:8]
+    file_path = None
+
+    try:
+        # Запуск тяжелого процесса в фоновом пуле потоков
+        file_path = await asyncio.to_thread(_sync_download, url, mode, quality, task_id)
+
+        if not os.path.exists(file_path):
+            raise FileNotFoundError("Файл не был создан.")
+
+        if os.path.getsize(file_path) > MAX_FILE_SIZE:
+            await callback.message.edit_text(
+                "❌ Размер файла превышает 50 МБ (ограничение Telegram Bot API)."
+            )
+            return
+
+        input_file = FSInputFile(file_path)
+
+        if mode == "audio":
+            await callback.message.answer_audio(audio=input_file, caption="🎵 Аудио готово")
+        else:
+            await callback.message.answer_video(
+                video=input_file, caption=f"🎬 Видео готово ({quality}p)"
+            )
+
+        await callback.message.delete()
+
+    except Exception as err:
+        await callback.message.edit_text(f"❌ Не удалось обработать: {err}")
+
+    finally:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+        await callback.answer()
